@@ -6,6 +6,7 @@ using System.IO;
 using System.Reflection;
 using System.Globalization;
 using System.Diagnostics;
+using System.Runtime.Serialization;
 
 public class EventImporter : AssetPostprocessor {
 
@@ -43,6 +44,7 @@ public class EventImporter : AssetPostprocessor {
 	{
 		ImportMode importMode = (ImportMode)EditorPrefs.GetInt (EventImporterPreferences.importModePref, (int)ImportMode.ImportOff);
 		if (importMode != ImportMode.ImportOff) {
+			// ModelImporter modelImporter = assetImporter as ModelImporter;
 			string modelBasePath = assetPath.Substring(0, assetPath.LastIndexOf("."));
 			string modelExt = assetPath.Substring (assetPath.LastIndexOf(".")).ToLower();
 
@@ -116,95 +118,108 @@ public class EventImporter : AssetPostprocessor {
 			}
 
 			if (eventData != null) {
-				Animation animation = g.GetComponent<Animation>();
-				if (animation != null) {
-					// add a component that receives the animation events!
-					g.AddComponent<EventReceiver>();
-					System.Type eventReceiverType = typeof(EventReceiver);
+				// add a component that receives the animation events!
+				g.AddComponent<EventReceiver>();
+				System.Type eventReceiverType = typeof(EventReceiver);
 
-					// a simple linear search would probably work as well, but let's do this properly in case
-					// someone has a silly amount of actions:
-					Dictionary<string, ActionInfo> actionInfoLookup = new Dictionary<string, ActionInfo>();
-					foreach(ActionInfo actionInfo in eventData.actionlist) {
-						actionInfoLookup[actionInfo.name] = actionInfo;
-					}
+				// a simple linear search would probably work as well, but let's do this properly in case
+				// someone has a silly amount of actions:
+				Dictionary<string, ActionInfo> actionInfoLookup = new Dictionary<string, ActionInfo>();
+				foreach(ActionInfo actionInfo in eventData.actionlist) {
+					actionInfoLookup[actionInfo.name] = actionInfo;
+				}
 
-					// process all animations
-					foreach(AnimationState animationState in animation) {
-						AnimationClip animationClip = animationState.clip;
-						List<AnimationEvent> animationEventList = new List<AnimationEvent>();
+				// get animations attached to the object:
+				List<AnimationClip> animationClipList = new List<AnimationClip>(AnimationUtility.GetAnimationClips(g));
 
-						if (actionInfoLookup.ContainsKey(animationClip.name)) { 
-							ActionInfo actionInfo = actionInfoLookup[animationClip.name];
+				// GetAnimationClips doesn't work with Mecanim, so use this hack:
+				if (animationClipList.Count == 0) {
+					// This is a bit ugly because it may pick up AnimationClip objects that are defined in the scene, but I 
+					// haven't found another way to get the clips imported with mecanim:
+					AnimationClip[] objectList = UnityEngine.Object.FindObjectsOfType (typeof(AnimationClip)) as AnimationClip[];
+					animationClipList.AddRange(objectList);
+				}
 
-							foreach(EventInfo eventInfo in actionInfo.eventList) {
-								AnimationEvent animationEvent = new AnimationEvent();
-								animationEvent.time = eventInfo.time;
+                // process all animations
+				foreach(AnimationClip animationClip in animationClipList) {
+					// check if we have animations for this clip
+					if (actionInfoLookup.ContainsKey(animationClip.name)) { 
+						// get the events for this clip
+						ActionInfo actionInfo = actionInfoLookup[animationClip.name];
 
-								// parse the string value into a function call. This can be a simple 
-								// tag to function mapping or any system you want.
-								// This code tries to parse the marker into a function call.
+                        // get existing animation events if they're defined through mecanim
+                        List<AnimationEvent> animationEventList = new List<AnimationEvent>(AnimationUtility.GetAnimationEvents(animationClip));
 
-								int openBracket = eventInfo.value.IndexOf("(");
-								int closeBracket = eventInfo.value.IndexOf (")");
+						// add events
+						foreach(EventInfo eventInfo in actionInfo.eventList) {
+							AnimationEvent animationEvent = new AnimationEvent();
+							animationEvent.time = eventInfo.time;
 
-								string functionName;
-								string parameter;
-								if (openBracket < 0) {
-									functionName = eventInfo.value;
+							// parse the string value into a function call. This can be a simple 
+							// tag to function mapping or any system you want.
+							// This code tries to parse the marker into a function call.
+
+							int openBracket = eventInfo.value.IndexOf("(");
+							int closeBracket = eventInfo.value.IndexOf (")");
+
+							string functionName;
+							string parameter;
+							if (openBracket < 0) {
+								functionName = eventInfo.value;
+								parameter = "";
+							} else {
+								functionName = eventInfo.value.Substring(0, openBracket).Trim();
+								if (closeBracket < 0) {
 									parameter = "";
 								} else {
-									functionName = eventInfo.value.Substring(0, openBracket).Trim();
-									if (closeBracket < 0) {
-										parameter = "";
-									} else {
-										parameter = eventInfo.value.Substring(openBracket + 1, closeBracket - openBracket - 1).Trim ();
-									}
+									parameter = eventInfo.value.Substring(openBracket + 1, closeBracket - openBracket - 1).Trim ();
 								}
+							}
 
-								// check if the event is defined and which type the parameter has. If there is more than one component to receive
-								// events this can become more complicated:
-								MethodInfo methodInfo = eventReceiverType.GetMethod(functionName);
-								animationEvent.functionName = functionName;
-								if (methodInfo != null) {
-									// use reflection data to parse the parameter
-									ParameterInfo[] parameterInfo = methodInfo.GetParameters();
-									if (parameterInfo.Length > 1) {
-										UnityEngine.Debug.LogWarning(String.Format("Method {0} has {1} parameters. One parameter is expected.", functionName, parameterInfo.Length));
-									} else {
-										if (parameterInfo.Length > 0) {
-											if (parameterInfo[0].ParameterType == typeof(float)) {
-												animationEvent.floatParameter = float.Parse(parameter, CultureInfo.InvariantCulture);
-											} else if (parameterInfo[0].ParameterType == typeof(int)) {
-												animationEvent.intParameter = int.Parse(parameter);
-											} else if (parameterInfo[0].ParameterType == typeof(string)) {
-												int openQuote = parameter.IndexOf("\"");
-												int closeQuote = parameter.LastIndexOf("\"");
-												animationEvent.stringParameter = parameter.Substring(openQuote + 1, closeQuote - openQuote - 1);
-											} else {
-												UnityEngine.Debug.LogWarning (String.Format("Method {0} parameter type {1} not handled.", functionName, parameterInfo.GetType().Name));
-											}
-										}
-									}
+							// check if the event is defined and which type the parameter has. If there is more than one component to receive
+							// events this can become more complicated:
+							MethodInfo methodInfo = eventReceiverType.GetMethod(functionName);
+							animationEvent.functionName = functionName;
+							if (methodInfo != null) {
+								// use reflection data to parse the parameter
+								ParameterInfo[] parameterInfo = methodInfo.GetParameters();
+								if (parameterInfo.Length > 1) {
+									UnityEngine.Debug.LogWarning(String.Format("Method {0} has {1} parameters. One parameter is expected.", functionName, parameterInfo.Length));
 								} else {
-									// fallback if a function is not defined.
-									UnityEngine.Debug.LogWarning (String.Format("Method {0} not found on class {1}. Adding animation event without type checking.", functionName, eventReceiverType.Name)); 
-									if (parameter.Length > 0) {
-										if (parameter.Contains("\"")) {
+									if (parameterInfo.Length > 0) {
+										if (parameterInfo[0].ParameterType == typeof(float)) {
+											animationEvent.floatParameter = float.Parse(parameter, CultureInfo.InvariantCulture);
+										} else if (parameterInfo[0].ParameterType == typeof(int)) {
+											animationEvent.intParameter = int.Parse(parameter);
+										} else if (parameterInfo[0].ParameterType == typeof(string)) {
 											int openQuote = parameter.IndexOf("\"");
 											int closeQuote = parameter.LastIndexOf("\"");
 											animationEvent.stringParameter = parameter.Substring(openQuote + 1, closeQuote - openQuote - 1);
-										} else if (parameter.Contains (".")) {
-											animationEvent.floatParameter = float.Parse(parameter, CultureInfo.InvariantCulture);
 										} else {
-											animationEvent.intParameter = int.Parse(parameter);
+											UnityEngine.Debug.LogWarning (String.Format("Method {0} parameter type {1} not handled.", functionName, parameterInfo.GetType().Name));
 										}
 									}
 								}
-								animationEventList.Add (animationEvent);
+							} else {
+								// fallback if a function is not defined.
+								UnityEngine.Debug.LogWarning (String.Format("Method {0} not found on class {1}. Adding animation event without type checking.", functionName, eventReceiverType.Name)); 
+								if (parameter.Length > 0) {
+									if (parameter.Contains("\"")) {
+										int openQuote = parameter.IndexOf("\"");
+										int closeQuote = parameter.LastIndexOf("\"");
+										animationEvent.stringParameter = parameter.Substring(openQuote + 1, closeQuote - openQuote - 1);
+									} else if (parameter.Contains (".")) {
+										animationEvent.floatParameter = float.Parse(parameter, CultureInfo.InvariantCulture);
+									} else {
+										animationEvent.intParameter = int.Parse(parameter);
+									}
+								}
 							}
-							AnimationUtility.SetAnimationEvents(animationClip, animationEventList.ToArray());
+							animationEventList.Add (animationEvent);
 						}
+
+						// store new events in the clip
+						AnimationUtility.SetAnimationEvents(animationClip, animationEventList.ToArray());
 					}
 				}
 			}
